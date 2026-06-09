@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+간판(billboard) 세그멘테이션 추론 스크립트
+================================================
+학습 설정과 동일하게 맞춤:
+  - 모델   : smp.DeepLabV3Plus(encoder_name='resnet50', classes=1, activation='sigmoid')
+             → 출력이 이미 sigmoid 확률이므로 threshold(0.5)만 적용
+  - 입력   : RGB, 512x512 Resize
+  - 정규화 : ImageNet mean=(0.485,0.456,0.406) std=(0.229,0.224,0.225)
+
+긴 파노라마(가로로 매우 긴 이미지)는 그대로 512x512로 줄이면 심하게 찌그러지므로,
+가로 방향 슬라이딩 윈도우(타일링)로 추론한 뒤 마스크를 다시 합칩니다.
+
+사용 예)
+  python infer_billboard.py --image stitched_final.jpg \
+      --model best_model_deeplabv3plus_resnet50.pth --outdir result
+"""
+
+import os
+import argparse
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import segmentation_models_pytorch as smp
+
+IMG_SIZE = 512
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# ------------------------------------------------------------------
+# 모델 정의 / 가중치 로드
+# ------------------------------------------------------------------
+def build_model(device):
+    # 학습 때 쓴 구조와 동일. 단, encoder_weights는 None:
+    # 어차피 학습된 .pth로 전부 덮어쓰므로 imagenet 가중치를 받을 필요가 없음.
+    model = smp.DeepLabV3Plus(
+        encoder_name='resnet50',
+        encoder_weights=None,
+        in_channels=3,
+        classes=1,
+        activation='sigmoid',
+    ).to(device)
+    model.eval()
+    return model
+
+
+def load_weights(model, path, device):
+    try:
+        obj = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        # 구버전 torch는 weights_only 인자가 없음
+        obj = torch.load(path, map_location=device)
+
+    # 1) 전체 모델 객체를 저장한 경우
+    if isinstance(obj, nn.Module):
+        return obj.to(device).eval()
+
+    # 2) state_dict 또는 체크포인트 dict
+    state = obj
+    if isinstance(obj, dict):
+        for key in ('state_dict', 'model_state_dict', 'model'):
+            if key in obj and isinstance(obj[key], dict):
+                state = obj[key]
+                break
+    # DataParallel 접두사 'module.' 제거
+    state = {k.replace('module.', '', 1): v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[warn] 로드되지 않은 파라미터 {len(missing)}개 (예: {missing[:3]})")
+    if unexpected:
+        print(f"[warn] 사용되지 않은 파라미터 {len(unexpected)}개 (예: {unexpected[:3]})")
+    return model.eval()
+
+
+# ------------------------------------------------------------------
+# 전처리 / 단일 패치 추론
+# ------------------------------------------------------------------
+def preprocess(rgb):
+    """HxWx3 uint8(RGB) -> 1x3x512x512 float tensor (학습 val_transform과 동일)."""
+    img = cv2.resize(rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    img = img.astype(np.float32) / 255.0
+    img = (img - MEAN) / STD
+    img = np.transpose(img, (2, 0, 1))[None]  # 1x3xHxW
+    return torch.from_numpy(img)
+
+
+@torch.no_grad()
+def infer_prob_512(model, rgb, device):
+    """임의 크기 RGB 패치 -> 512x512 확률맵(numpy)."""
+    x = preprocess(rgb).to(device)
+    p = model(x)                      # (1,1,512,512), sigmoid 확률
+    return p.squeeze().float().cpu().numpy()
+
+
+# ------------------------------------------------------------------
+# 전체 이미지 추론 (긴 이미지는 가로 타일링)
+# ------------------------------------------------------------------
+@torch.no_grad()
+def predict_full(model, bgr, device, tile=None, overlap=0.5):
+    """원본 BGR -> 원본 해상도 확률맵(HxW numpy)."""
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    H, W = rgb.shape[:2]
+
+    if tile is None:
+        tile = H                      # 정사각 윈도우(=이미지 높이) → 종횡비 왜곡 최소
+    tile = int(min(tile, W))
+
+    # 거의 정사각이면 통째로 한 번에
+    if W <= tile * 1.2:
+        p = infer_prob_512(model, rgb, device)
+        return cv2.resize(p, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    stride = max(1, int(tile * (1 - overlap)))
+    xs = list(range(0, max(W - tile, 0) + 1, stride))
+    if xs[-1] != W - tile:
+        xs.append(W - tile)           # 오른쪽 끝 정렬
+
+    prob = np.zeros((H, W), np.float32)
+    wsum = np.zeros((H, W), np.float32)
+
+    # 가로 삼각형 가중치 → 타일 경계 seam 완화
+    wx = 1.0 - np.abs(np.linspace(-1, 1, tile))
+    wx = np.clip(wx, 0.05, 1.0)
+    wmask = np.broadcast_to(wx, (H, tile)).astype(np.float32)
+
+    for x in xs:
+        crop = rgb[:, x:x + tile]                       # H x tile
+        p = infer_prob_512(model, crop, device)         # 512 x 512
+        p = cv2.resize(p, (tile, H), interpolation=cv2.INTER_LINEAR)
+        prob[:, x:x + tile] += p * wmask
+        wsum[:, x:x + tile] += wmask
+
+    prob /= np.maximum(wsum, 1e-6)
+    return prob
+
+
+# ------------------------------------------------------------------
+# 시각화
+# ------------------------------------------------------------------
+def make_overlay(bgr, mask, alpha=0.3):
+    """마스크 영역을 빨강 반투명 채움 + 얇은 노란 윤곽선으로 표시."""
+    overlay = bgr.copy()
+    red = np.zeros_like(bgr)
+    red[..., 2] = 255                               # BGR → 빨강
+    m = mask > 0
+    overlay[m] = (alpha * red[m] + (1 - alpha) * bgr[m]).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)  # 노란선, 두께 1(얇게)
+    return overlay
+
+
+# ------------------------------------------------------------------
+# 메인
+# ------------------------------------------------------------------
+IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp')
+
+
+def collect_images(path):
+    """파일이면 [그 파일], 폴더면 안의 이미지 파일 목록을 정렬해 반환."""
+    if os.path.isdir(path):
+        files = [os.path.join(path, f) for f in os.listdir(path)
+                 if f.lower().endswith(IMG_EXTS)]
+        return sorted(files)
+    return [path]
+
+
+def run_one(model, img_path, device, args):
+    """이미지 한 장 추론 + 결과 저장."""
+    bgr = cv2.imread(img_path)
+    if bgr is None:
+        print(f"[skip] 열 수 없음: {img_path}")
+        return
+    H, W = bgr.shape[:2]
+
+    tile = args.tile if args.tile > 0 else None
+    prob = predict_full(model, bgr, device, tile=tile, overlap=args.overlap)
+    mask = (prob > args.threshold).astype(np.uint8) * 255
+    ratio = (mask > 0).mean() * 100
+
+    base = os.path.splitext(os.path.basename(img_path))[0]
+    cv2.imwrite(os.path.join(args.outdir, f"{base}_mask.png"), mask)
+    cv2.imwrite(os.path.join(args.outdir, f"{base}_prob.png"),
+                (np.clip(prob, 0, 1) * 255).astype(np.uint8))
+    cv2.imwrite(os.path.join(args.outdir, f"{base}_overlay.jpg"),
+                make_overlay(bgr, mask, alpha=args.alpha),
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
+    print(f"  [done] {base}  ({W}x{H})  간판 {ratio:.2f}%")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="간판 세그멘테이션 추론")
+    ap.add_argument('--image', required=True,
+                    help='입력 이미지 경로 또는 폴더 경로(폴더면 안의 이미지 전부 처리)')
+    ap.add_argument('--model', default='best_model_deeplabv3plus_resnet50.pth',
+                    help='학습된 .pth 경로')
+    ap.add_argument('--outdir', default='result', help='결과 저장 폴더')
+    ap.add_argument('--threshold', type=float, default=0.5, help='이진화 임계값')
+    ap.add_argument('--tile', type=int, default=0,
+                    help='가로 타일 너비(px). 0이면 이미지 높이로 자동')
+    ap.add_argument('--overlap', type=float, default=0.5, help='타일 겹침 비율(0~0.9)')
+    ap.add_argument('--alpha', type=float, default=0.3, help='오버레이 투명도(낮을수록 옅음)')
+    args = ap.parse_args()
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"DEVICE: {device}")
+
+    images = collect_images(args.image)
+    if not images:
+        raise FileNotFoundError(f"처리할 이미지가 없음: {args.image}")
+    print(f"대상 이미지: {len(images)}개")
+
+    model = build_model(device)
+    model = load_weights(model, args.model, device)
+    print(f"모델 로드 완료: {args.model}")
+
+    os.makedirs(args.outdir, exist_ok=True)
+    for i, img_path in enumerate(images, 1):
+        print(f"[{i}/{len(images)}] {os.path.basename(img_path)}")
+        run_one(model, img_path, device, args)
+
+    print(f"\n전체 완료! 결과 폴더: {args.outdir}")
+
+
+if __name__ == '__main__':
+    main()
