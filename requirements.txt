@@ -1,0 +1,11 @@
+# --- Core analysis (always required) ---
+numpy>=1.24
+matplotlib>=3.7
+opencv-python>=4.8
+scipy>=1.10
+
+# --- Segmentation pipeline (infer_to_hsv.py only) ---
+# 다른 3개 스크립트만 쓸 거면 아래는 건너뛰어도 됨.
+torch>=2.0
+torchvision>=0.15
+segmentation-models-pytorch>=0.3
