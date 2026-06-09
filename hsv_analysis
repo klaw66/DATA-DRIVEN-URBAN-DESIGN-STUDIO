@@ -1,0 +1,198 @@
+"""
+명동 facade strip HSV 분석 — Macau paper(Chen et al. 2022) 스타일 출력
+
+References:
+- Chen et al. (2022). Computer vision quantization research on the architectural
+  color of Avenida de Almeida Ribeiro in Macau. PLoS ONE.
+
+Requirements:
+    pip install numpy matplotlib opencv-python
+
+Usage:
+    아래 CONFIG 섹션에서 IMG_PATH, OUT_PATH 만 너 환경에 맞게 수정 후 실행
+    python hsv_analysis.py
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
+import cv2
+
+# =====================================================================
+# CONFIG — 여기만 수정하면 됨
+# =====================================================================
+INPUT_DIR        = "input_images"        # 입력 이미지 폴더
+OUTPUT_DIR       = "output_results"      # 결과 저장 폴더
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
+
+# 분석 파라미터
+N_SAMPLE        = 40000   # polar plot에 찍을 점 수 (메모리/속도 조절)
+POLAR_MIN_S     = 0.12    # S가 이 값보다 낮은 픽셀은 polar plot에서 제외 (회색 픽셀)
+HIGH_SAT_THRESH = 0.30    # 이 값보다 채도 높은 점은 "전경"으로 크게/진하게
+N_HIST_BINS     = 120     # S, V 히스토그램 bin 수
+RANDOM_SEED     = 42      # 재현성
+
+# =====================================================================
+# 1. 이미지 로드 및 HSV 변환
+# =====================================================================
+img_bgr = cv2.imread(IMG_PATH)
+if img_bgr is None:
+    raise FileNotFoundError(f"이미지 못 찾음: {IMG_PATH}")
+
+img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+
+# OpenCV의 HSV는 H: 0-179, S: 0-255, V: 0-255 → 0-1로 정규화
+H = img_hsv[..., 0].astype(np.float32) / 179.0
+S = img_hsv[..., 1].astype(np.float32) / 255.0
+V = img_hsv[..., 2].astype(np.float32) / 255.0
+
+print(f"Image shape: {img_rgb.shape}")
+print(f"Total pixels: {H.size:,}")
+
+# =====================================================================
+# 2. 통계 (전체 픽셀 기준)
+# =====================================================================
+stats = {
+    "Mean H (deg)":      H.mean() * 360,
+    "Mean S":            S.mean(),
+    "Std  S":            S.std(),
+    "Mean V":            V.mean(),
+    "Std  V":            V.std(),
+    "High-chroma (S>0.5) %": (S > 0.5).mean() * 100,
+    "Low-chroma  (S<0.1) %": (S < 0.1).mean() * 100,
+}
+
+# =====================================================================
+# 3. polar plot용 픽셀 샘플링
+# =====================================================================
+np.random.seed(RANDOM_SEED)
+n_total = H.size
+n_sample = min(N_SAMPLE, n_total)
+idx = np.random.choice(n_total, n_sample, replace=False)
+
+H_s, S_s, V_s = H.flatten()[idx], S.flatten()[idx], V.flatten()[idx]
+
+# 회색 픽셀 제거
+mask = S_s > POLAR_MIN_S
+H_polar = H_s[mask]
+S_polar = S_s[mask]
+V_polar = V_s[mask]
+
+# Radial striping 방지용 jitter
+H_jit = H_polar + np.random.uniform(-0.008, 0.008, H_polar.shape)
+S_jit = np.clip(S_polar + np.random.uniform(-0.02, 0.02, S_polar.shape), 0, 1)
+
+# 점 색깔은 원본 HSV 그대로 — boost 없음
+rgb_pts = hsv_to_rgb(np.stack([H_polar, S_polar, V_polar], axis=1))
+
+print(f"Polar points (S>{POLAR_MIN_S}): {len(H_polar):,}")
+
+# =====================================================================
+# 4. Figure
+# =====================================================================
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+fig = plt.figure(figsize=(15, 7.5), facecolor='#f0f0f0')
+gs = fig.add_gridspec(
+    2, 2,
+    width_ratios=[1.35, 1],
+    height_ratios=[1, 1],
+    wspace=0.10, hspace=0.32,
+    left=0.04, right=0.97, top=0.93, bottom=0.08,
+)
+
+# ---------- H polar (Munsell-style wheel) ----------
+ax_h = fig.add_subplot(gs[:, 0], projection='polar')
+ax_h.set_facecolor('#f0f0f0')
+
+theta = H_jit * 2 * np.pi
+radius = S_jit
+
+# Two-pass scatter: 저채도 배경 → 고채도 전경
+high_mask = S_polar > HIGH_SAT_THRESH
+low_mask  = ~high_mask
+
+ax_h.scatter(theta[low_mask],  radius[low_mask],
+             c=rgb_pts[low_mask],  s=3.5, alpha=0.40,
+             edgecolors='none', rasterized=True)
+ax_h.scatter(theta[high_mask], radius[high_mask],
+             c=rgb_pts[high_mask], s=8.0, alpha=0.85,
+             edgecolors='none', rasterized=True)
+
+# 축 설정
+ax_h.set_ylim(0, 1)
+ax_h.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+ax_h.set_yticklabels([])
+ax_h.set_rlabel_position(80)
+
+# Munsell 10주요색 라벨
+munsell_labels = ['5R', '5YR', '5Y', '5GY', '5G', '5BG', '5B', '5PB', '5P', '5RP']
+angles_main = np.linspace(0, 2 * np.pi, 11)[:-1]
+ax_h.set_xticks(angles_main)
+ax_h.set_xticklabels([])
+
+for ang, lab in zip(angles_main, munsell_labels):
+    ax_h.text(ang, 1.13, lab, ha='center', va='center',
+              fontsize=11, fontweight='bold', color='#333')
+
+# 반지름 눈금 라벨 (작게)
+for r in [0.2, 0.4, 0.6, 0.8]:
+    ax_h.text(np.deg2rad(80), r, f'{r:.1f}',
+              fontsize=7, color='#aaa', ha='center', va='bottom')
+
+ax_h.grid(True, alpha=0.25, linewidth=0.4, color='#999')
+ax_h.spines['polar'].set_color('#bbb')
+ax_h.spines['polar'].set_linewidth(0.8)
+ax_h.text(-0.02, 1.02, 'H', transform=ax_h.transAxes,
+          fontsize=28, fontweight='bold', color='#222')
+
+# ---------- 히스토그램 헬퍼 ----------
+def gradient_hist(ax, data, n_bins, color_func, label_letter):
+    counts, edges = np.histogram(data.flatten(), bins=n_bins, range=(0, 1))
+    centers = (edges[:-1] + edges[1:]) / 2
+    width = 1 / n_bins
+
+    bar_colors = np.array([color_func(c) for c in centers])
+    ax.bar(centers, counts, width=width * 1.02, color=bar_colors,
+           edgecolor='none', align='center', linewidth=0)
+
+    ax.set_facecolor('#b8b8b8')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(bottom=0)
+    ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticks([])
+    for spine in ['top', 'right', 'left']:
+        ax.spines[spine].set_visible(False)
+    ax.spines['bottom'].set_color('#888')
+    ax.spines['bottom'].set_linewidth(1.0)
+    ax.tick_params(axis='x', colors='#333', length=3, labelsize=9)
+    ax.text(0.015, 0.88, label_letter, transform=ax.transAxes,
+            fontsize=24, fontweight='bold', color='#1a1a1a')
+
+# ---------- S histogram (흰색 → 빨강 그라데이션) ----------
+def s_color(s_val):
+    return (1.0, 1.0 - 0.85 * s_val, 1.0 - 0.85 * s_val)
+
+ax_s = fig.add_subplot(gs[0, 1])
+gradient_hist(ax_s, S, N_HIST_BINS, s_color, 'S')
+
+# ---------- V histogram (검정 → 옅은 푸른 흰색) ----------
+def v_color(v_val):
+    return (v_val, v_val, min(1.0, v_val * 1.05 + 0.02))
+
+ax_v = fig.add_subplot(gs[1, 1])
+gradient_hist(ax_v, V, N_HIST_BINS, v_color, 'V')
+
+# =====================================================================
+# 5. 저장 및 통계 출력
+# =====================================================================
+plt.savefig(OUT_PATH, dpi=200, bbox_inches='tight', facecolor='#f0f0f0')
+print(f"\nSaved: {OUT_PATH}")
+
+print("\n--- Stats (raw pixel basis) ---")
+for k, v in stats.items():
+    if isinstance(v, float):
+        print(f"  {k}: {v:.3f}")
+    else:
+        print(f"  {k}: {v}")
